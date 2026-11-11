@@ -5,6 +5,60 @@ import pytest
 from checkov.common.util.str_utils import removeprefix
 from checkov.common.util.str_utils import convert_to_seconds
 from checkov.common.util.str_utils import get_rootless_path
+from checkov.common.util.str_utils import skip_check_matches_check_id, skip_check_matches_custom_check_id
+
+
+@pytest.mark.parametrize(
+    "skip_check,check_id,bc_check_id,expected",
+    [
+        # exact Checkov ID match
+        ({"id": "CKV_AWS_1"}, "CKV_AWS_1", None, True),
+        # near IDs must never match via substring semantics
+        ({"id": "CKV_AWS_1"}, "CKV_AWS_10", None, False),
+        ({"id": "CKV_AWS_1"}, "CKV_AWS_100", None, False),
+        ({"id": "CKV_AWS_100"}, "CKV_AWS_1", None, False),
+        ({"id": "CKV_AWS_100"}, "CKV_AWS_10", None, False),
+        ({"id": "CKV_AWS_10"}, "CKV_AWS_100", None, False),
+        # Bridgecrew ID normalized to Checkov ID, original kept in bc_id
+        ({"id": "CKV_AWS_15", "bc_id": "BC_AWS_IAM_5"}, "CKV_AWS_15", "BC_AWS_IAM_5", True),
+        ({"id": "CKV_AWS_15", "bc_id": "BC_AWS_IAM_5"}, "CKV_AWS_16", "BC_AWS_IAM_6", False),
+        # offline runs: raw Bridgecrew ID remains in id, match via record bc_check_id
+        ({"id": "BC_AWS_IAM_5"}, "CKV_AWS_15", "BC_AWS_IAM_5", True),
+        ({"id": "BC_AWS_IAM_5"}, "CKV_AWS_15", "BC_AWS_IAM_6", False),
+        # defensive: empty values never match
+        ({"id": ""}, "CKV_AWS_1", None, False),
+        ({}, "CKV_AWS_1", None, False),
+    ],
+)
+def test_skip_check_matches_check_id(skip_check, check_id, bc_check_id, expected):
+    assert skip_check_matches_check_id(skip_check, check_id, bc_check_id) is expected
+
+
+@pytest.mark.parametrize(
+    "skip_id,check_id,expected",
+    [
+        ("CKV_CUSTOM_a12f9ef1-1234-5678-1234-1234d0225678",
+         "CKV_CUSTOM_a12f9ef1-1234-5678-1234-1234d0225678", True),
+        # different prefix, same UUID still suppresses custom checks
+        ("LETTER_CUSTOM_a12f9ef1-1234-5678-1234-1234d0225678",
+         "CKV_CUSTOM_a12f9ef1-1234-5678-1234-1234d0225678", True),
+        # same prefix family but different UUID must not suppress
+        ("CKV_CUSTOM_ffffffff-ffff-ffff-ffff-ffffffffffff",
+         "CKV_CUSTOM_a12f9ef1-1234-5678-1234-1234d0225678", False),
+        # fuzzy custom matching never applies to built-in check IDs
+        ("CKV_AWS_1", "CKV_AWS_10", False),
+        ("", "CKV_AWS_1", False),
+    ],
+)
+def test_skip_check_matches_custom_check_id(skip_id, check_id, expected):
+    assert skip_check_matches_custom_check_id(skip_id, check_id) is expected
+
+
+def test_skip_check_matches_custom_check_id_can_be_disabled():
+    skip_id = "LETTER_CUSTOM_a12f9ef1-1234-5678-1234-1234d0225678"
+    check_id = "CKV_CUSTOM_a12f9ef1-1234-5678-1234-1234d0225678"
+    assert skip_check_matches_custom_check_id(skip_id, check_id, prefix_suppression_enabled=False) is False
+    assert skip_check_matches_custom_check_id(skip_id, check_id) is True
 
 
 @pytest.mark.parametrize(

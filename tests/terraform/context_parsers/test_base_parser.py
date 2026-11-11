@@ -16,6 +16,7 @@ mock_tf_file = os.path.dirname(os.path.realpath(__file__)) + "/mock_tf_files/moc
 mock_definition = (mock_tf_file, {"mock": [{"mock_type": {"mock_name": {"value": ["mock_value"]}}}]})
 
 inline_tf_file = os.path.dirname(os.path.realpath(__file__)) + "/mock_tf_files/inline_suppression.tf"
+exact_id_tf_file = os.path.dirname(os.path.realpath(__file__)) + "/mock_tf_files/exact_id_suppression.tf"
 mock_dir_path = os.path.dirname(os.path.realpath(__file__)) + "/mock_tf_files"
 
 
@@ -71,6 +72,37 @@ class TestBaseParser(unittest.TestCase):
         self.assertEqual(len(aws_s3_bucket_resources["one-line-one-check"].get("skipped_checks")), 1)
         self.assertEqual(len(aws_s3_bucket_resources["one-line-multi-checks"].get("skipped_checks")), 2)
         self.assertEqual(len(aws_s3_bucket_resources["no-comment"].get("skipped_checks")), 0)
+
+    def test_skip_comments_keep_full_ids_and_support_multi_id(self):
+        # offline run: no policy metadata is fetched, so comment IDs are kept verbatim
+        parser = TFParser()
+        _, tf_definition = parser.parse_hcl_module(mock_dir_path, source='TERRAFORM')
+        resources_parser = ResourceContextParser()
+        parser_registry.register(resources_parser)
+        exact_id_key = TFDefinitionKey(exact_id_tf_file)
+        definition_context = parser_registry.enrich_definitions_context(
+            (exact_id_key, tf_definition[exact_id_key])
+        )
+
+        resources = definition_context[exact_id_key]["resource"]["aws_s3_bucket"]
+
+        single = resources["near_id_single"]["skipped_checks"]
+        self.assertEqual([skip["id"] for skip in single], ["CKV_AWS_1"])
+        self.assertEqual(single[0]["suppress_comment"], "only the single-digit check is skipped")
+
+        multi = resources["near_id_multi"]["skipped_checks"]
+        self.assertEqual(
+            [skip["id"] for skip in multi],
+            ["CKV_AWS_1", "CKV_AWS_10", "CKV_AWS_100"],
+        )
+        self.assertEqual(multi[0]["suppress_comment"], "two exact IDs in one comment")
+        self.assertEqual(multi[2]["suppress_comment"], "the three-digit check is skipped separately")
+
+        bridgecrew = resources["bridgecrew_id"]["skipped_checks"]
+        self.assertEqual([skip["id"] for skip in bridgecrew], ["BC_AWS_IAM_5"])
+        self.assertEqual(bridgecrew[0]["suppress_comment"], "bridgecrew id with a reason")
+
+        self.assertEqual(resources["no_suppression"].get("skipped_checks"), [])
 
 
 if __name__ == "__main__":

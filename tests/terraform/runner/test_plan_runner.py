@@ -1,4 +1,5 @@
 import itertools
+import json
 import os
 import unittest
 from collections import defaultdict
@@ -16,6 +17,9 @@ from checkov.common.checks.base_check_registry import BaseCheckRegistry
 from checkov.common.graph.db_connectors.networkx.networkx_db_connector import NetworkxConnector
 from checkov.common.graph.db_connectors.rustworkx.rustworkx_db_connector import RustworkxConnector
 from checkov.common.models.enums import CheckCategories, CheckResult
+from checkov.common.output.sarif import Sarif
+from checkov.common.runners.runner_registry import RunnerRegistry
+from checkov.common.util.banner import banner
 from checkov.runner_filter import RunnerFilter
 from checkov.terraform import TFDefinitionKey
 from checkov.terraform.checks.resource.base_resource_check import BaseResourceCheck
@@ -1014,6 +1018,108 @@ class TestRunnerValid(unittest.TestCase):
          'alias': ['storage_use_azuread'], 'end_line': [14], 'start_line': [0], 'storage_use_azuread': True}
         resource_name = "storage_use_azuread"
         assert get_entity_id(resource_type_dict, resource_name) == 'azure.storage_use_azuread'
+
+    def _register_always_failing_s3_checks(self, check_ids: list[str]) -> None:
+        class AlwaysFailingS3Check(BaseResourceCheck):
+            def __init__(self, check_id: str) -> None:
+                super().__init__(
+                    name=f"always failing {check_id}",
+                    id=check_id,
+                    categories=[CheckCategories.GENERAL_SECURITY],
+                    supported_resources=["aws_s3_bucket"],
+                )
+
+            def scan_resource_conf(self, conf: Dict[str, Any]) -> CheckResult:
+                return CheckResult.FAILED
+
+        resource_registry.checks = defaultdict(list)
+        for check_id in check_ids:
+            resource_registry.register(AlwaysFailingS3Check(check_id))
+
+    def test_plan_skip_uses_full_id_matching_with_near_ids(self):
+        # regression: checkov:skip=CKV_AWS_1 must not also skip CKV_AWS_10 / CKV_AWS_100
+        current_dir = os.path.dirname(os.path.realpath(__file__))
+        repo_root = current_dir + "/resources/plan_exact_id_skip_enrichment"
+        valid_plan_path = repo_root + "/tfplan.json"
+        check_ids = ["CKV_AWS_1", "CKV_AWS_10", "CKV_AWS_100"]
+        self._register_always_failing_s3_checks(check_ids)
+
+        runner_registry = RunnerRegistry(
+            banner, RunnerFilter(checks=check_ids, framework=["terraform_plan"]), Runner(db_connector=self.db_connector())
+        )
+        report = runner_registry.run(
+            repo_root_for_plan_enrichment=[repo_root], files=[valid_plan_path]
+        )[0]
+
+        self.assertEqual(
+            sorted(record.check_id for record in report.skipped_checks),
+            ["CKV_AWS_1"],
+        )
+        skipped_record = report.skipped_checks[0]
+        self.assertEqual(skipped_record.check_result["suppress_comment"], "only the single-digit check is skipped")
+        self.assertEqual(
+            sorted(record.check_id for record in report.failed_checks),
+            ["CKV_AWS_10", "CKV_AWS_100"],
+        )
+        # JSON and SARIF counts must stay consistent with the in-memory report
+        report_json = json.loads(report.get_json())
+        self.assertEqual(len(report_json["results"]["skipped_checks"]), 1)
+        self.assertEqual(report_json["summary"]["skipped"], 1)
+        sarif_results = Sarif(reports=[report], tool="checkov").json["runs"][0]["results"]
+        self.assertEqual(len(sarif_results), 3)
+        self.assertEqual(
+            sorted(result["ruleId"] for result in sarif_results),
+            ["CKV_AWS_1", "CKV_AWS_10", "CKV_AWS_100"],
+        )
+
+    def test_plan_skip_supports_multiple_ids_and_bridgecrew_mapping(self):
+        current_dir = os.path.dirname(os.path.realpath(__file__))
+        repo_root = current_dir + "/resources/plan_exact_id_skip_enrichment"
+        valid_plan_path = repo_root + "/tfplan.json"
+        check_ids = ["CKV_AWS_20", "CKV_AWS_21", "CKV_AWS_144", "CKV_AWS_145"]
+        runner_registry = RunnerRegistry(
+            banner, RunnerFilter(checks=check_ids, framework=["terraform_plan"]), Runner(db_connector=self.db_connector())
+        )
+        report = runner_registry.run(
+            repo_root_for_plan_enrichment=[repo_root], files=[valid_plan_path]
+        )[0]
+
+        # CKV_AWS_144 is a near ID of the skipped CKV_AWS_145 and must remain FAILED
+        self.assertEqual(sorted(record.check_id for record in report.failed_checks), ["CKV_AWS_144"])
+        skipped = {record.check_id: record.check_result["suppress_comment"] for record in report.skipped_checks}
+        self.assertEqual(
+            skipped,
+            {
+                "CKV_AWS_20": "multiple exact IDs share one comment",
+                "CKV_AWS_21": "multiple exact IDs share one comment",
+                "CKV_AWS_145": "only the exact 145 check is skipped",
+            },
+        )
+        self.assertEqual(report.get_summary()["skipped"], 3)
+
+    def test_plan_skip_on_nested_module_uses_full_id_matching(self):
+        current_dir = os.path.dirname(os.path.realpath(__file__))
+        repo_root = current_dir + "/resources/plan_nested_module_skip_enrichment"
+        valid_plan_path = repo_root + "/tfplan.json"
+        check_ids = ["CKV_AWS_1", "CKV_AWS_10", "CKV_AWS_100"]
+        self._register_always_failing_s3_checks(check_ids)
+
+        # the outer module block skips CKV_AWS_1 only; the resource lives two modules deep
+        runner_registry = RunnerRegistry(
+            banner,
+            RunnerFilter(checks=check_ids, framework=["terraform_plan"]),
+            Runner(db_connector=self.db_connector()),
+        )
+        report = runner_registry.run(
+            repo_root_for_plan_enrichment=[repo_root], files=[valid_plan_path]
+        )[0]
+
+        self.assertEqual(sorted(record.check_id for record in report.skipped_checks), ["CKV_AWS_1"])
+        self.assertEqual(
+            sorted(record.check_id for record in report.failed_checks),
+            ["CKV_AWS_10", "CKV_AWS_100"],
+        )
+        self.assertEqual(report.get_summary()["skipped"], 1)
 
 
 if __name__ == "__main__":

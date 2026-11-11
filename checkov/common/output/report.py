@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from collections.abc import Iterable
 
 from typing import List, Dict, Union, Any, Optional, TYPE_CHECKING, cast
@@ -21,6 +22,7 @@ from checkov.common.output.record import Record, SCA_PACKAGE_SCAN_CHECK_NAME
 from checkov.common.sast.consts import POLICIES_ERRORS, POLICIES_ERRORS_COUNT, SOURCE_FILES_COUNT, POLICY_COUNT
 from checkov.common.util.consts import PARSE_ERROR_FAIL_FLAG, S3_UPLOAD_DETAILS_MESSAGE
 from checkov.common.util.json_utils import CustomJSONEncoder
+from checkov.common.util.str_utils import skip_check_matches_check_id
 from checkov.runner_filter import RunnerFilter
 
 from checkov.sca_package_2.output import create_cli_output as create_sca_package_cli_output_v2
@@ -576,38 +578,59 @@ class Report:
     def handle_skipped_checks(
             report: "Report", enriched_resources: Dict[str, Dict[str, Any]]
     ) -> "Report":
-        module_address_len = len("module.")
         skip_records = []
         for record in report.failed_checks:
             resource_raw_id = Report.get_plan_resource_raw_id(record.resource)
             resource_skips = enriched_resources.get(resource_raw_id, {}).get("skipped_checks", [])
             for skip in resource_skips:
-                if record.check_id in skip["id"]:
+                if skip_check_matches_check_id(skip, record.check_id, record.bc_check_id):
                     # Mark for removal and add it as a skipped record. It is not safe to remove
                     # the record from failed_checks immediately because we're iterating over it
-                    skip_records.append(record)
-                    record.check_result["result"] = CheckResult.SKIPPED
-                    record.check_result["suppress_comment"] = skip["suppress_comment"]
-                    report.add_record(record)
+                    Report._mark_record_as_skipped(record, skip, report, skip_records)
+                    break
 
-            if record.resource_address and record.resource_address.startswith("module."):
-                module_path = record.resource_address[module_address_len:record.resource_address.index('.', module_address_len + 1)]
-                # For module with for_each or count, the module path will be module.module_name[(.*)]. We can
-                # ignore the index and the for_each value and just use the module name as it's not possible to
-                # skip checks for a specific instance of a module
-                module_path = module_path.split('[')[0]
+            # Skip comments on enclosing modules apply to every resource inside them,
+            # including resources nested several modules deep (e.g. module.a.module.b.type.name).
+            for module_path in Report.get_module_address_parts(record.resource_address):
                 module_enrichments = enriched_resources.get(module_path, {})
                 for module_skip in module_enrichments.get("skipped_checks", []):
-                    if record.check_id in module_skip["id"]:
-                        skip_records.append(record)
-                        record.check_result["result"] = CheckResult.SKIPPED
-                        record.check_result["suppress_comment"] = module_skip["suppress_comment"]
-                        report.add_record(record)
+                    if skip_check_matches_check_id(module_skip, record.check_id, record.bc_check_id):
+                        Report._mark_record_as_skipped(record, module_skip, report, skip_records)
+                        break
 
         for record in skip_records:
             if record in report.failed_checks:
                 report.failed_checks.remove(record)
         return report
+
+    @staticmethod
+    def get_module_address_parts(resource_address: str | None) -> List[str]:
+        """Return the enclosing module names of a plan resource address, outermost first.
+
+        Example: ``module.a["x"].module.b[0].aws_s3_bucket.name`` -> ``["a", "b"]``.
+        Module count/for_each indexes are dropped because a skip comment cannot target a
+        specific module instance.
+        """
+        if not resource_address:
+            return []
+        module_names = re.findall(r"module\.(?:[^.\[]+|\[[^\]]*\])", resource_address)
+        return [name.removeprefix("module.").split("[")[0] for name in module_names]
+
+    @staticmethod
+    def _mark_record_as_skipped(
+            record: Record,
+            skip: Dict[str, Any],
+            report: "Report",
+            skip_records: List[Record],
+    ) -> None:
+        # A record can match skips on both the resource and an enclosing module;
+        # only move it to skipped_checks once to keep JSON/SARIF counts consistent.
+        if record in skip_records:
+            return
+        skip_records.append(record)
+        record.check_result["result"] = CheckResult.SKIPPED
+        record.check_result["suppress_comment"] = skip["suppress_comment"]
+        report.add_record(record)
 
     @staticmethod
     def get_plan_resource_raw_id(resource_id: str) -> str:
