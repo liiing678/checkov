@@ -5,7 +5,9 @@ from collections import defaultdict
 from operator import itemgetter
 
 from checkov.common.models.enums import CheckResult
-from typing import Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, cast
+
+from checkov.common.util.file_utils import convert_to_unix_path
 
 if TYPE_CHECKING:
     from checkov.common.output.record import Record
@@ -85,14 +87,32 @@ class Baseline:
     def _is_check_in_baseline(self, check: Record) -> bool:
         failed_check_id = check.check_id
         failed_check_resource = check.resource
+        failed_check_file_path = self._normalize_file_path(check.file_path)
         for baseline_failed_check in self.failed_checks:
+            baseline_file_path = self._normalize_file_path(baseline_failed_check.get("file"))
             for finding in baseline_failed_check["findings"]:
-                if finding["resource"] == failed_check_resource and failed_check_id in finding["check_ids"]:
+                if (
+                    finding["resource"] != failed_check_resource
+                    or failed_check_id not in finding.get("check_ids", [])
+                ):
+                    continue
+                if not baseline_file_path:
+                    # Legacy baseline entries that only carry the resource and the
+                    # check ids cannot be scoped to a file/module, so keep the
+                    # historical resource + rule matching for them.
+                    return True
+                if baseline_file_path == failed_check_file_path:
                     return True
         return False
+
+    @staticmethod
+    def _normalize_file_path(file_path: str | None) -> str:
+        if not file_path:
+            return ""
+        return cast(str, convert_to_unix_path(file_path)).strip()
 
     def from_json(self, file_path: str) -> None:
         self.path = file_path
         with open(file_path, "r") as f:
             baseline_raw = json.load(f)
-            self.failed_checks = baseline_raw.get("failed_checks", {})
+            self.failed_checks = baseline_raw.get("failed_checks", [])
